@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - ".github/workflows/lieumt-build.yml"
+      - ".github/workflows/build.yml"
       - "lieuMt/**"
   pull_request:
     paths:
-      - ".github/workflows/lieumt-build.yml"
+      - ".github/workflows/build.yml"
       - "lieuMt/**"
 
 jobs:
@@ -33,22 +33,45 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Detect project layout
+        id: layout
+        run: |
+          if [ -f "lieuMt/CMakeLists.txt" ]; then
+            echo "source_dir=lieuMt" >> "$GITHUB_OUTPUT"
+            echo "build_dir=lieuMt/build" >> "$GITHUB_OUTPUT"
+            echo "binary_path=lieuMt/build/lieuMt" >> "$GITHUB_OUTPUT"
+            echo "readme_path=lieuMt/README.md" >> "$GITHUB_OUTPUT"
+          elif [ -f "CMakeLists.txt" ]; then
+            echo "source_dir=." >> "$GITHUB_OUTPUT"
+            echo "build_dir=build" >> "$GITHUB_OUTPUT"
+            echo "binary_path=build/lieuMt" >> "$GITHUB_OUTPUT"
+            echo "readme_path=README.md" >> "$GITHUB_OUTPUT"
+          else
+            echo "Could not find CMakeLists.txt for lieuMt." >&2
+            exit 1
+          fi
+
       - name: Configure lieuMt
-        run: cmake -S lieuMt -B lieuMt/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: >
+          cmake
+          -S "${{ steps.layout.outputs.source_dir }}"
+          -B "${{ steps.layout.outputs.build_dir }}"
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
 
       - name: Build lieuMt
-        run: cmake --build lieuMt/build --config Release --parallel
+        run: cmake --build "${{ steps.layout.outputs.build_dir }}" --config Release --parallel
 
       - name: Show binary details
         run: |
-          ls -lah lieuMt/build
-          file lieuMt/build/lieuMt
+          ls -lah "${{ steps.layout.outputs.build_dir }}"
+          file "${{ steps.layout.outputs.binary_path }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: lieuMt-debian12
           path: |
-            lieuMt/build/lieuMt
-            lieuMt/README.md
+            ${{ steps.layout.outputs.binary_path }}
+            ${{ steps.layout.outputs.readme_path }}
           if-no-files-found: error
