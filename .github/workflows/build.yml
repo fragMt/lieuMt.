@@ -26,6 +26,7 @@ jobs:
             build-essential \
             ca-certificates \
             cmake \
+            file \
             git \
             ninja-build \
             p7zip-full
@@ -65,7 +66,9 @@ jobs:
       - name: Show binary details
         run: |
           ls -lah "${{ steps.layout.outputs.build_dir }}"
-          file "${{ steps.layout.outputs.binary_path }}"
+          if command -v file >/dev/null 2>&1; then
+            file "${{ steps.layout.outputs.binary_path }}"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
