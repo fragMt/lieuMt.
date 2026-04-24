@@ -1,0 +1,54 @@
+name: Build lieuMt
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/lieumt-build.yml"
+      - "lieuMt/**"
+  pull_request:
+    paths:
+      - ".github/workflows/lieumt-build.yml"
+      - "lieuMt/**"
+
+jobs:
+  build-debian-12:
+    name: Debian 12 build
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            git \
+            ninja-build \
+            p7zip-full
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure lieuMt
+        run: cmake -S lieuMt -B lieuMt/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build lieuMt
+        run: cmake --build lieuMt/build --config Release --parallel
+
+      - name: Show binary details
+        run: |
+          ls -lah lieuMt/build
+          file lieuMt/build/lieuMt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lieuMt-debian12
+          path: |
+            lieuMt/build/lieuMt
+            lieuMt/README.md
+          if-no-files-found: error
