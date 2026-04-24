@@ -540,10 +540,6 @@ public:
             config_.version = *version;
         }
         const auto active_version = version_value();
-        if (!command_exists_7z()) {
-            throw std::runtime_error("7z was not found on PATH; install 7-Zip or add 7z to PATH");
-        }
-
         fs::create_directories(config_.root);
         fs::create_directories(files_cache_dir());
         fs::create_directories(marks_cache_dir());
@@ -575,7 +571,7 @@ public:
             entry.relative_path = relative_path;
             entry.size = item.file_size();
             entry.sha256 = sha256_file(absolute);
-            ensure_package(entry);
+            load_package_metadata_if_present(entry);
             next_entries.push_back(std::move(entry));
         }
 
@@ -624,6 +620,23 @@ public:
         return *found;
     }
 
+    std::optional<FileEntry> ensure_package_ready(const std::string& sha) {
+        auto entry = package_entry(sha);
+        if (!entry) {
+            return std::nullopt;
+        }
+
+        ensure_package(*entry);
+
+        std::scoped_lock lock(mutex_);
+        auto found = std::ranges::find(entries_, sha, &FileEntry::sha256);
+        if (found != entries_.end()) {
+            found->package_size = entry->package_size;
+            found->package_sha256 = entry->package_sha256;
+        }
+        return entry;
+    }
+
     std::optional<MarkedTreeBundle> mark_bundle(const std::string& archive_name) const {
         std::scoped_lock lock(mutex_);
         auto found = std::ranges::find(marked_bundles_, archive_name, &MarkedTreeBundle::archive_name);
@@ -631,6 +644,23 @@ public:
             return std::nullopt;
         }
         return *found;
+    }
+
+    std::optional<MarkedTreeBundle> ensure_mark_bundle_ready(const std::string& archive_name) {
+        auto bundle = mark_bundle(archive_name);
+        if (!bundle) {
+            return std::nullopt;
+        }
+
+        ensure_mark_bundle(*bundle);
+
+        std::scoped_lock lock(mutex_);
+        auto found = std::ranges::find(marked_bundles_, archive_name, &MarkedTreeBundle::archive_name);
+        if (found != marked_bundles_.end()) {
+            found->package_size = bundle->package_size;
+            found->package_sha256 = bundle->package_sha256;
+        }
+        return bundle;
     }
 
     void add_mark(const std::string& raw_path,
@@ -761,6 +791,9 @@ private:
     }
 
     void ensure_mark_bundle(MarkedTreeBundle& bundle) {
+        if (!command_exists_7z()) {
+            throw std::runtime_error("7z was not found on PATH; install 7-Zip or add 7z to PATH");
+        }
         if (!fs::exists(bundle.archive_path)) {
             fs::create_directories(bundle.archive_path.parent_path());
             const std::string command = "cd " + shell_quote(config_.root)
@@ -779,6 +812,16 @@ private:
         bundle.archive_url = "/marks/" + bundle.archive_name;
     }
 
+    void load_mark_bundle_metadata_if_present(MarkedTreeBundle& bundle) const {
+        bundle.archive_name = bundle.archive_path.filename().string();
+        bundle.archive_url = "/marks/" + bundle.archive_name;
+        if (!fs::exists(bundle.archive_path)) {
+            return;
+        }
+        bundle.package_size = fs::file_size(bundle.archive_path);
+        bundle.package_sha256 = sha256_file(bundle.archive_path);
+    }
+
     std::vector<MarkedTreeBundle> build_marked_bundles(std::string_view version, const std::vector<MarkRule>& marks) {
         std::vector<MarkedTreeBundle> bundles;
         for (const MarkRule& mark : marks) {
@@ -794,7 +837,7 @@ private:
             bundle.file_count = files.size();
             bundle.tree_sha256 = compute_tree_sha256(files);
             bundle.archive_path = mark_archive_path(mark.relative_path, bundle.tree_sha256);
-            ensure_mark_bundle(bundle);
+            load_mark_bundle_metadata_if_present(bundle);
             bundles.push_back(std::move(bundle));
         }
         std::ranges::sort(bundles, {}, &MarkedTreeBundle::relative_path);
@@ -802,6 +845,9 @@ private:
     }
 
     void ensure_package(FileEntry& entry) {
+        if (!command_exists_7z()) {
+            throw std::runtime_error("7z was not found on PATH; install 7-Zip or add 7z to PATH");
+        }
         const auto package = package_path(entry.sha256);
         if (!fs::exists(package)) {
             const auto tmp = package;
@@ -812,6 +858,15 @@ private:
             if (code != 0) {
                 throw std::runtime_error("7z failed while packing " + entry.relative_path);
             }
+        }
+        entry.package_size = fs::file_size(package);
+        entry.package_sha256 = sha256_file(package);
+    }
+
+    void load_package_metadata_if_present(FileEntry& entry) const {
+        const auto package = package_path(entry.sha256);
+        if (!fs::exists(package)) {
+            return;
         }
         entry.package_size = fs::file_size(package);
         entry.package_sha256 = sha256_file(package);
@@ -842,7 +897,7 @@ private:
                 << "    package: files/" << entry.sha256 << ".7z\n"
                 << "    package_size: " << entry.package_size << '\n'
                 << "    package_sha256: " << entry.package_sha256 << '\n'
-                << "    memory_eligible: " << (entry.package_size <= max_memory_package_size ? "true" : "false") << '\n';
+                << "    memory_eligible: unknown\n";
         }
         out << "\nmarks:\n";
         for (const MarkedTreeBundle& bundle : marked_bundles) {
@@ -1290,7 +1345,13 @@ private:
             return;
         }
         const auto sha = target.substr(prefix.size(), target.size() - prefix.size() - suffix.size());
-        if (!is_hex_sha256(sha) || !index_.package_entry(sha)) {
+        if (!is_hex_sha256(sha)) {
+            send_response(client, make_text_response(404, "Not Found", "Package not found.\n"));
+            return;
+        }
+
+        const auto entry = index_.ensure_package_ready(sha);
+        if (!entry) {
             send_response(client, make_text_response(404, "Not Found", "Package not found.\n"));
             return;
         }
@@ -1331,7 +1392,7 @@ private:
             return;
         }
 
-        const auto bundle = index_.mark_bundle(archive_name);
+        const auto bundle = index_.ensure_mark_bundle_ready(archive_name);
         if (!bundle) {
             send_response(client, make_text_response(404, "Not Found", "Marked archive not found.\n"));
             return;
@@ -1634,8 +1695,6 @@ int main(int argc, char** argv) {
         auto config = parse_args(argc, argv);
 
         ContentIndex index(std::move(config));
-        index.regenerate();
-
         PackageCache cache;
         HttpServer server(index, cache);
         server.start();
@@ -1644,6 +1703,15 @@ int main(int argc, char** argv) {
         std::cout << "Serving root " << fs::absolute(index.config().root).string() << '\n';
 
         std::atomic<bool> running = true;
+        std::thread initial_regen([&] {
+            try {
+                std::cout << "Initial checksum regen starting...\n";
+                index.regenerate();
+                std::cout << "Initial checksum regen finished.\n";
+            } catch (const std::exception& error) {
+                std::cout << "Initial checksum regen failed: " << error.what() << '\n';
+            }
+        });
         std::thread daily_regen([&] {
             auto next = next_local_noon();
             while (running) {
@@ -1663,6 +1731,9 @@ int main(int argc, char** argv) {
         });
         console_loop(index, cache, server, running);
         running = false;
+        if (initial_regen.joinable()) {
+            initial_regen.join();
+        }
         if (daily_regen.joinable()) {
             daily_regen.join();
         }

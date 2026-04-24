@@ -35,7 +35,8 @@ Default flags:
 
 - Scans the configured game root and generates `version.toon` and `checksum.toon`
 - Excludes `/cache/` and the generated `.toon` files from the checksum pass
-- Packs each tracked file into `/cache/files/<sha256>.7z`
+- Publishes package paths in `checksum.toon` and creates missing `.7z` archives on first request
+- Caches tracked file packages in `/cache/files/<sha256>.7z`
 - Can mark whole subtrees for authoritative replacement archives under `/cache/marks/`
 - Serves packages from RAM when the compressed archive is `<= 128MB`
 - Regenerates metadata daily at local `12:00`
@@ -66,8 +67,8 @@ Upload or replace files over SSH, SCP, rsync, or SFTP, then run `regen`.
 ## Console
 
 - `status`: shows bind address, version, file counts, checksum state, and active sends
-- `regen`: rebuilds manifests and missing packages without changing the version label
-- `regen -version "v1.1.6"`: rebuilds manifests and also sets a specific version label
+- `regen`: rebuilds `version.toon` and `checksum.toon` without changing the version label
+- `regen -version "v1.1.6"`: rebuilds the `.toon` files and also sets a specific version label
 - `mark /bin/ --force-delete-excess`: treat a subtree as authoritative and rebuild a grouped archive for it
 - `mark /csgo/bin/ -version "v1.1.6" --force-delete-excess`: same, while also stamping the marked subtree with an operator-facing version label
 - `cache`: shows RAM cache stats
@@ -94,6 +95,7 @@ Detach from `screen` with `Ctrl+A` then `D`.
 - launcher patching or launcher self-update can live in a separate service
 - unmarked files stay in replace-only mode: if a file does not exist locally, it is skipped rather than created
 - marked subtrees are different: the launcher downloads the grouped subtree archive, replaces that directory wholesale, and deletes excess files by virtue of replacing the entire tree
+- package archives are lazy: `regen` hashes files and updates manifests, while `.7z` files are created only when a launcher requests them
 
 ## Name
 
