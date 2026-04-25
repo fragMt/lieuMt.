@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cctype>
@@ -118,6 +119,7 @@ struct ResponseSpec {
     std::string content_type = "text/plain; charset=utf-8";
     std::string body_text;
     std::vector<std::uint8_t> body_bytes;
+    std::vector<std::pair<std::string, std::string>> headers;
     std::string cache_control = "no-store";
 };
 
@@ -653,16 +655,22 @@ public:
 
         ensure_package(*entry);
 
-        std::scoped_lock lock(mutex_);
-        auto found = std::ranges::find(entries_, sha, &FileEntry::sha256);
-        if (found == entries_.end()) {
-            found = std::ranges::find(entries_, sha, &FileEntry::xxh3_64);
+        std::string version_text;
+        std::string checksum_text;
+        {
+            std::scoped_lock lock(mutex_);
+            auto found = std::ranges::find(entries_, sha, &FileEntry::sha256);
+            if (found == entries_.end()) {
+                found = std::ranges::find(entries_, sha, &FileEntry::xxh3_64);
+            }
+            if (found != entries_.end()) {
+                found->package_size = entry->package_size;
+                found->package_sha256 = entry->package_sha256;
+                found->package_xxh3_64 = entry->package_xxh3_64;
+            }
+            rebuild_manifest_texts_locked(version_text, checksum_text);
         }
-        if (found != entries_.end()) {
-            found->package_size = entry->package_size;
-            found->package_sha256 = entry->package_sha256;
-            found->package_xxh3_64 = entry->package_xxh3_64;
-        }
+        write_manifest_texts(version_text, checksum_text);
         return entry;
     }
 
@@ -687,12 +695,19 @@ public:
 
         ensure_mark_bundle(*bundle);
 
-        std::scoped_lock lock(mutex_);
-        auto found = std::ranges::find(marked_bundles_, archive_name, &MarkedTreeBundle::archive_name);
-        if (found != marked_bundles_.end()) {
-            found->package_size = bundle->package_size;
-            found->package_sha256 = bundle->package_sha256;
+        std::string version_text;
+        std::string checksum_text;
+        {
+            std::scoped_lock lock(mutex_);
+            auto found = std::ranges::find(marked_bundles_, archive_name, &MarkedTreeBundle::archive_name);
+            if (found != marked_bundles_.end()) {
+                found->package_size = bundle->package_size;
+                found->package_sha256 = bundle->package_sha256;
+                found->package_xxh3_64 = bundle->package_xxh3_64;
+            }
+            rebuild_manifest_texts_locked(version_text, checksum_text);
         }
+        write_manifest_texts(version_text, checksum_text);
         return bundle;
     }
 
@@ -808,6 +823,21 @@ private:
 
     fs::path marks_config_path() const {
         return config_.cache / "marks.toon";
+    }
+
+    void rebuild_manifest_texts_locked(std::string& version_text, std::string& checksum_text) {
+        version_text = build_version_toon(entries_, config_.version);
+        checksum_text = build_checksum_toon(entries_, marked_bundles_, config_.version);
+        version_toon_ = version_text;
+        checksum_toon_ = checksum_text;
+        generated_at_ = std::chrono::system_clock::now();
+    }
+
+    void write_manifest_texts(const std::string& version_text, const std::string& checksum_text) const {
+        write_text_file(config_.root / "version.toon", version_text);
+        write_text_file(config_.root / "checksum.toon", checksum_text);
+        write_text_file(config_.cache / "version.toon", version_text);
+        write_text_file(config_.cache / "checksum.toon", checksum_text);
     }
 
     std::vector<MarkRule> current_marks() const {
@@ -1227,7 +1257,18 @@ bool send_all(socket_handle socket, const std::uint8_t* data, std::size_t size) 
     while (size > 0) {
         const auto chunk_size = std::min<std::size_t>(size, 64 * 1024);
         upload_bandwidth_limiter.acquire(chunk_size);
-        const auto sent = send(socket, reinterpret_cast<const char*>(data), static_cast<int>(chunk_size), 0);
+        const auto sent = send(socket,
+                               reinterpret_cast<const char*>(data),
+                               static_cast<int>(chunk_size),
+#ifdef MSG_NOSIGNAL
+                               MSG_NOSIGNAL
+#else
+                               0
+#endif
+        );
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
         if (sent <= 0) {
             return false;
         }
@@ -1618,7 +1659,9 @@ private:
 
         if (const auto cached = package_cache_.get(sha)) {
             std::cout << ip << " sending " << sha << ".7z from RAM\n";
-            send_response(client, make_binary_response("application/x-7z-compressed", *cached, "public, max-age=300, immutable"));
+            auto response = make_binary_response("application/x-7z-compressed", *cached, "public, max-age=300, immutable");
+            response.headers = package_headers(*entry);
+            send_response(client, response);
             return;
         }
 
@@ -1629,13 +1672,19 @@ private:
             package_cache_.put(sha, bytes);
             package_cache_.record_miss();
             std::cout << ip << " sending " << sha << ".7z from disk into RAM cache\n";
-            send_response(client, make_binary_response("application/x-7z-compressed", std::move(bytes), "public, max-age=300, immutable"));
+            auto response = make_binary_response("application/x-7z-compressed", std::move(bytes), "public, max-age=300, immutable");
+            response.headers = package_headers(*entry);
+            send_response(client, response);
             return;
         }
 
         package_cache_.record_miss();
         std::cout << ip << " streaming " << sha << ".7z from disk\n";
-        send_file_stream(client, path, "application/x-7z-compressed", "public, max-age=300, immutable");
+        send_file_stream(client,
+                         path,
+                         "application/x-7z-compressed",
+                         "public, max-age=300, immutable",
+                         package_headers(*entry));
     }
 
     void send_mark_archive(socket_handle client, const std::string& target, const std::string& ip) {
@@ -1664,7 +1713,9 @@ private:
         if (bundle->package_size <= max_cached_package_size) {
             if (const auto cached = package_cache_.get(cache_key)) {
                 std::cout << ip << " sending mark " << bundle->relative_path << " from RAM\n";
-                send_response(client, make_binary_response("application/x-7z-compressed", *cached, "public, max-age=300, immutable"));
+                auto response = make_binary_response("application/x-7z-compressed", *cached, "public, max-age=300, immutable");
+                response.headers = mark_package_headers(*bundle);
+                send_response(client, response);
                 return;
             }
 
@@ -1672,13 +1723,19 @@ private:
             package_cache_.put(cache_key, bytes);
             package_cache_.record_miss();
             std::cout << ip << " sending mark " << bundle->relative_path << " from disk into RAM cache\n";
-            send_response(client, make_binary_response("application/x-7z-compressed", std::move(bytes), "public, max-age=300, immutable"));
+            auto response = make_binary_response("application/x-7z-compressed", std::move(bytes), "public, max-age=300, immutable");
+            response.headers = mark_package_headers(*bundle);
+            send_response(client, response);
             return;
         }
 
         package_cache_.record_miss();
         std::cout << ip << " streaming mark " << bundle->relative_path << " from disk\n";
-        send_file_stream(client, bundle->archive_path, "application/x-7z-compressed", "public, max-age=300, immutable");
+        send_file_stream(client,
+                         bundle->archive_path,
+                         "application/x-7z-compressed",
+                         "public, max-age=300, immutable",
+                         mark_package_headers(*bundle));
     }
 
     void send_static_file(socket_handle client, const std::string& target) {
@@ -1712,6 +1769,24 @@ private:
         send_file_stream(client, resolved, mime_type(resolved), "public, max-age=60");
     }
 
+    static std::vector<std::pair<std::string, std::string>> package_headers(const FileEntry& entry) {
+        return {
+            {"X-LieuMt-Package-Size", std::to_string(entry.package_size)},
+            {"X-LieuMt-Package-XXH3", entry.package_xxh3_64},
+            {"X-LieuMt-Source-Size", std::to_string(entry.size)},
+            {"X-LieuMt-Source-XXH3", entry.xxh3_64}
+        };
+    }
+
+    static std::vector<std::pair<std::string, std::string>> mark_package_headers(const MarkedTreeBundle& bundle) {
+        return {
+            {"X-LieuMt-Package-Size", std::to_string(bundle.package_size)},
+            {"X-LieuMt-Package-XXH3", bundle.package_xxh3_64},
+            {"X-LieuMt-Tree-XXH3", bundle.tree_xxh3_64},
+            {"X-LieuMt-File-Count", std::to_string(bundle.file_count)}
+        };
+    }
+
     void send_response(socket_handle client, const ResponseSpec& response) {
         const std::size_t body_size = response.body_bytes.empty()
             ? response.body_text.size()
@@ -1724,8 +1799,11 @@ private:
                 << "X-Content-Type-Options: nosniff\r\n"
                 << "X-Frame-Options: DENY\r\n"
                 << "Referrer-Policy: no-referrer\r\n"
-                << "Content-Security-Policy: default-src 'none'\r\n"
-                << "Connection: close\r\n\r\n";
+                << "Content-Security-Policy: default-src 'none'\r\n";
+        for (const auto& [name, value] : response.headers) {
+            headers << name << ": " << value << "\r\n";
+        }
+        headers << "Connection: close\r\n\r\n";
         send_all(client, headers.str());
         if (!response.body_bytes.empty()) {
             send_all(client, response.body_bytes.data(), response.body_bytes.size());
@@ -1737,7 +1815,8 @@ private:
     void send_file_stream(socket_handle client,
                           const fs::path& path,
                           std::string_view content_type,
-                          std::string_view cache_control) {
+                          std::string_view cache_control,
+                          const std::vector<std::pair<std::string, std::string>>& extra_headers = {}) {
         std::ifstream input(path, std::ios::binary);
         if (!input) {
             send_response(client, make_text_response(404, "Not Found", "File not found.\n"));
@@ -1752,8 +1831,11 @@ private:
                 << "X-Content-Type-Options: nosniff\r\n"
                 << "X-Frame-Options: DENY\r\n"
                 << "Referrer-Policy: no-referrer\r\n"
-                << "Content-Security-Policy: default-src 'none'\r\n"
-                << "Connection: close\r\n\r\n";
+                << "Content-Security-Policy: default-src 'none'\r\n";
+        for (const auto& [name, value] : extra_headers) {
+            headers << name << ": " << value << "\r\n";
+        }
+        headers << "Connection: close\r\n\r\n";
         send_all(client, headers.str());
 
         std::array<std::uint8_t, 64 * 1024> bytes{};
@@ -1957,6 +2039,8 @@ void console_loop(ContentIndex& index, PackageCache& cache, HttpServer& server, 
 
 int main(int argc, char** argv) {
     try {
+        std::signal(SIGPIPE, SIG_IGN);
+
         auto config = parse_args(argc, argv);
 
         ContentIndex index(std::move(config));
