@@ -30,6 +30,8 @@ Default flags:
 
 `lieuMt.` requires `7z` on `PATH`. On Debian 12 that usually means `p7zip-full`.
 
+The source-level `max_upload_bandwidth_mbps` constant defaults to `220.0`, so all HTTP responses share a single upload budget and leave headroom for the game servers.
+
 ## What It Does
 
 - Scans the configured game root and generates `version.toon` and `checksum.toon`
@@ -39,7 +41,9 @@ Default flags:
 - Publishes package paths in `checksum.toon` and creates missing `.7z` archives on first request
 - Caches tracked file packages in `/cache/files/<sha256>.7z`
 - Can mark whole subtrees for authoritative replacement archives under `/cache/marks/`
-- Serves packages from RAM when the compressed archive is `<= 128MB`
+- Keeps generated archives on disk and reuses the same archive for every later client with the same content hash
+- Serializes first-build requests for the same archive, so concurrent clients wait for one shared `.7z` instead of racing duplicate 7-Zip jobs
+- Serves small hot packages from a bounded RAM cache; large VPK-sized archives are streamed from the persistent disk cache
 - Regenerates metadata daily at local `12:00`
 - Lets you trigger manual regen from the console
 
@@ -72,6 +76,7 @@ Upload or replace files over SSH, SCP, rsync, or SFTP, then run `regen`.
 - `regen -version "v1.1.6"`: rebuilds the `.toon` files and also sets a specific version label
 - `mark /bin/ --force-delete-excess`: treat a subtree as authoritative and rebuild a grouped archive for it
 - `mark /csgo/bin/ -version "v1.1.6" --force-delete-excess`: same, while also stamping the marked subtree with an operator-facing version label
+- `warm`: build any missing package archives ahead of player traffic
 - `cache`: shows RAM cache stats
 - `cache clear`: clears the RAM cache
 - `help`: prints the command list
@@ -96,7 +101,8 @@ Detach from `screen` with `Ctrl+A` then `D`.
 - launcher patching or launcher self-update can live in a separate service
 - unmarked files stay in replace-only mode: if a file does not exist locally, it is skipped rather than created
 - marked subtrees are different: the launcher downloads the grouped subtree archive, replaces that directory wholesale, and deletes excess files by virtue of replacing the entire tree
-- package archives are lazy: `regen` hashes files and updates manifests, while `.7z` files are created only when a launcher requests them
+- package archives are lazy and persistent: `regen` hashes files and updates manifests, while `.7z` files are created only when a launcher requests them, then kept under `/cache/files/` or `/cache/marks/` for later clients
+- use `warm` after `regen` if you want to pay the compression cost before players arrive instead of letting the first requesting client trigger it
 
 ## Name
 

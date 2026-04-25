@@ -16,6 +16,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -43,13 +44,18 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr std::uint64_t max_memory_package_size = 128ull * 1024ull * 1024ull;
+constexpr std::uint64_t max_cached_package_size = 16ull * 1024ull * 1024ull;
+constexpr std::uint64_t max_total_memory_cache_size = 256ull * 1024ull * 1024ull;
+constexpr double max_upload_bandwidth_mbps = 220.0;
+constexpr std::uint64_t max_upload_bytes_per_second =
+    static_cast<std::uint64_t>((max_upload_bandwidth_mbps * 1000.0 * 1000.0) / 8.0);
 constexpr std::size_t max_request_bytes = 16 * 1024;
 constexpr int listen_backlog = 32;
 constexpr int socket_timeout_seconds = 15;
 constexpr int max_connections_per_ip = 8;
-constexpr int max_requests_per_minute = 180;
-constexpr int max_package_requests_per_minute = 90;
+constexpr int max_active_clients = 64;
+constexpr int max_requests_per_minute = 1200;
+constexpr int max_package_requests_per_minute = 600;
 
 struct Config {
     fs::path root = "client-root";
@@ -416,7 +422,8 @@ std::string sanitize_token(std::string value) {
 }
 
 bool command_exists_7z() {
-    return std::system("command -v 7z >/dev/null 2>&1") == 0;
+    static const bool available = std::system("command -v 7z >/dev/null 2>&1") == 0;
+    return available;
 }
 
 class PackageCache {
@@ -428,17 +435,26 @@ public:
             return std::nullopt;
         }
         ++hits_;
-        return found->second;
+        touch_locked(found);
+        return found->second.bytes;
     }
 
     void put(const std::string& sha, std::vector<std::uint8_t> bytes) {
-        if (bytes.size() > max_memory_package_size) {
+        if (bytes.size() > max_cached_package_size) {
             return;
         }
         std::scoped_lock lock(mutex_);
-        memory_bytes_ -= entries_[sha].size();
+        auto found = entries_.find(sha);
+        if (found != entries_.end()) {
+            memory_bytes_ -= found->second.bytes.size();
+            order_.erase(found->second.order);
+            entries_.erase(found);
+        }
+
+        evict_until_fits_locked(bytes.size());
+        order_.push_front(sha);
         memory_bytes_ += bytes.size();
-        entries_[sha] = std::move(bytes);
+        entries_.emplace(sha, CacheEntry{std::move(bytes), order_.begin()});
     }
 
     void record_miss() {
@@ -449,6 +465,7 @@ public:
     void clear() {
         std::scoped_lock lock(mutex_);
         entries_.clear();
+        order_.clear();
         memory_bytes_ = 0;
         hits_ = 0;
         misses_ = 0;
@@ -465,8 +482,35 @@ public:
     }
 
 private:
+    struct CacheEntry {
+        std::vector<std::uint8_t> bytes;
+        std::list<std::string>::iterator order;
+    };
+
+    using EntryMap = std::unordered_map<std::string, CacheEntry>;
+
+    void touch_locked(EntryMap::iterator found) {
+        order_.erase(found->second.order);
+        order_.push_front(found->first);
+        found->second.order = order_.begin();
+    }
+
+    void evict_until_fits_locked(std::size_t incoming_size) {
+        while (!order_.empty() && memory_bytes_ + incoming_size > max_total_memory_cache_size) {
+            const std::string oldest = order_.back();
+            order_.pop_back();
+            auto found = entries_.find(oldest);
+            if (found == entries_.end()) {
+                continue;
+            }
+            memory_bytes_ -= found->second.bytes.size();
+            entries_.erase(found);
+        }
+    }
+
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, std::vector<std::uint8_t>> entries_;
+    EntryMap entries_;
+    std::list<std::string> order_;
     std::uint64_t memory_bytes_ = 0;
     std::uint64_t hits_ = 0;
     std::uint64_t misses_ = 0;
@@ -611,11 +655,19 @@ public:
 
         std::scoped_lock lock(mutex_);
         auto found = std::ranges::find(entries_, sha, &FileEntry::sha256);
+        if (found == entries_.end()) {
+            found = std::ranges::find(entries_, sha, &FileEntry::xxh3_64);
+        }
         if (found != entries_.end()) {
             found->package_size = entry->package_size;
             found->package_sha256 = entry->package_sha256;
+            found->package_xxh3_64 = entry->package_xxh3_64;
         }
         return entry;
+    }
+
+    fs::path package_path_for_entry(const FileEntry& entry) const {
+        return package_path(entry.xxh3_64.empty() ? entry.sha256 : entry.xxh3_64);
     }
 
     std::optional<MarkedTreeBundle> mark_bundle(const std::string& archive_name) const {
@@ -685,22 +737,64 @@ public:
         std::scoped_lock lock(mutex_);
         std::uint64_t source_bytes = 0;
         std::uint64_t package_bytes = 0;
+        std::size_t built_packages = 0;
         for (const auto& entry : entries_) {
             source_bytes += entry.size;
             package_bytes += entry.package_size;
+            if (entry.package_size > 0) {
+                ++built_packages;
+            }
+        }
+        std::size_t built_marked_bundles = 0;
+        for (const auto& bundle : marked_bundles_) {
+            if (bundle.package_size > 0) {
+                ++built_marked_bundles;
+            }
         }
         std::ostringstream out;
         out << "root: " << fs::absolute(config_.root).string() << '\n'
             << "cache: " << fs::absolute(config_.cache).string() << '\n'
             << "listen: " << config_.host << ':' << config_.port << '\n'
             << "version: " << config_.version << '\n'
+            << "upload cap: " << max_upload_bandwidth_mbps << " Mbit/s\n"
             << "checksum: " << (regenerating_.load() ? "running" : "idle") << '\n'
             << "marks: " << marks_.size() << '\n'
             << "marked bundles: " << marked_bundles_.size() << '\n'
+            << "built marked bundles: " << built_marked_bundles << '/' << marked_bundles_.size() << '\n'
             << "files: " << entries_.size() << '\n'
+            << "built file packages: " << built_packages << '/' << entries_.size() << '\n'
             << "source bytes: " << source_bytes << '\n'
             << "package bytes: " << package_bytes;
         return out.str();
+    }
+
+    std::size_t warm_packages() {
+        const auto file_entries = entries();
+        std::vector<MarkedTreeBundle> mark_entries;
+        {
+            std::scoped_lock lock(mutex_);
+            mark_entries = marked_bundles_;
+        }
+
+        std::size_t warmed = 0;
+        for (FileEntry entry : file_entries) {
+            const auto path = package_path_for_entry(entry);
+            if (fs::exists(path)) {
+                continue;
+            }
+            ensure_package(entry);
+            ++warmed;
+        }
+
+        for (MarkedTreeBundle bundle : mark_entries) {
+            if (fs::exists(bundle.archive_path)) {
+                continue;
+            }
+            ensure_mark_bundle(bundle);
+            ++warmed;
+        }
+
+        return warmed;
     }
 
 private:
@@ -788,20 +882,41 @@ private:
         return marks_cache_dir() / (slug + "-" + std::string(tree_sha256.substr(0, 16)) + ".7z");
     }
 
+    std::shared_ptr<std::mutex> package_lock_for(const std::string& key) {
+        std::scoped_lock lock(package_locks_mutex_);
+        auto& lock_ptr = package_locks_[key];
+        if (!lock_ptr) {
+            lock_ptr = std::make_shared<std::mutex>();
+        }
+        return lock_ptr;
+    }
+
     void ensure_mark_bundle(MarkedTreeBundle& bundle) {
         if (!command_exists_7z()) {
             throw std::runtime_error("7z was not found on PATH; install 7-Zip or add 7z to PATH");
         }
+
+        const auto build_lock = package_lock_for("mark:" + bundle.archive_name);
+        std::scoped_lock package_lock(*build_lock);
+
         if (!fs::exists(bundle.archive_path)) {
             fs::create_directories(bundle.archive_path.parent_path());
+            const fs::path tmp = bundle.archive_path.string() + ".tmp." + std::to_string(::getpid()) + ".7z";
+            fs::remove(tmp);
             const std::string command = "cd " + shell_quote(config_.root)
                 + " && 7z a -t7z -mx=9 -bd -y "
-                + shell_quote(bundle.archive_path) + " "
+                + shell_quote(tmp) + " "
                 + shell_quote(bundle.relative_path);
-            const int code = std::system(command.c_str());
+            int code = 0;
+            {
+                std::scoped_lock compression_lock(compression_mutex_);
+                code = std::system(command.c_str());
+            }
             if (code != 0) {
+                fs::remove(tmp);
                 throw std::runtime_error("7z failed while packing marked tree " + bundle.relative_path);
             }
+            fs::rename(tmp, bundle.archive_path);
         }
 
         bundle.package_size = fs::file_size(bundle.archive_path);
@@ -846,16 +961,26 @@ private:
         if (!command_exists_7z()) {
             throw std::runtime_error("7z was not found on PATH; install 7-Zip or add 7z to PATH");
         }
-        const auto package = package_path(entry.xxh3_64.empty() ? entry.sha256 : entry.xxh3_64);
+        const auto package = package_path_for_entry(entry);
+        const auto build_lock = package_lock_for("file:" + package.filename().string());
+        std::scoped_lock package_lock(*build_lock);
+
         if (!fs::exists(package)) {
-            const auto tmp = package;
+            const fs::path tmp = package.string() + ".tmp." + std::to_string(::getpid()) + ".7z";
             fs::create_directories(tmp.parent_path());
+            fs::remove(tmp);
             const std::string command = "7z a -t7z -mx=9 -bd -y "
                 + shell_quote(tmp) + " " + shell_quote(entry.absolute_path);
-            const int code = std::system(command.c_str());
+            int code = 0;
+            {
+                std::scoped_lock compression_lock(compression_mutex_);
+                code = std::system(command.c_str());
+            }
             if (code != 0) {
+                fs::remove(tmp);
                 throw std::runtime_error("7z failed while packing " + entry.relative_path);
             }
+            fs::rename(tmp, package);
         }
         entry.package_size = fs::file_size(package);
         entry.package_xxh3_64 = xxh3_file(package);
@@ -1017,6 +1142,9 @@ private:
 
     mutable std::mutex mutex_;
     std::mutex regen_mutex_;
+    std::mutex compression_mutex_;
+    std::mutex package_locks_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<std::mutex>> package_locks_;
     std::atomic<bool> regenerating_ = false;
     Config config_;
     std::vector<FileEntry> entries_;
@@ -1031,9 +1159,51 @@ void close_socket(socket_handle socket) {
     close(socket);
 }
 
+class UploadBandwidthLimiter {
+public:
+    void acquire(std::size_t bytes) {
+        if (bytes == 0 || max_upload_bytes_per_second == 0) {
+            return;
+        }
+
+        std::unique_lock lock(mutex_);
+        refill_locked();
+        while (tokens_ < static_cast<double>(bytes)) {
+            const double missing = static_cast<double>(bytes) - tokens_;
+            const auto wait_for = std::chrono::duration<double>(missing / static_cast<double>(max_upload_bytes_per_second));
+            cv_.wait_for(lock, std::chrono::duration_cast<std::chrono::microseconds>(wait_for));
+            refill_locked();
+        }
+        tokens_ -= static_cast<double>(bytes);
+    }
+
+private:
+    void refill_locked() {
+        const auto now = std::chrono::steady_clock::now();
+        const std::chrono::duration<double> elapsed = now - last_refill_;
+        if (elapsed.count() <= 0.0) {
+            return;
+        }
+
+        tokens_ = std::min<double>(
+            static_cast<double>(max_upload_bytes_per_second),
+            tokens_ + elapsed.count() * static_cast<double>(max_upload_bytes_per_second));
+        last_refill_ = now;
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    double tokens_ = static_cast<double>(max_upload_bytes_per_second);
+    std::chrono::steady_clock::time_point last_refill_ = std::chrono::steady_clock::now();
+};
+
+UploadBandwidthLimiter upload_bandwidth_limiter;
+
 bool send_all(socket_handle socket, const std::uint8_t* data, std::size_t size) {
     while (size > 0) {
-        const auto sent = send(socket, reinterpret_cast<const char*>(data), static_cast<int>(std::min<std::size_t>(size, 64 * 1024)), 0);
+        const auto chunk_size = std::min<std::size_t>(size, 64 * 1024);
+        upload_bandwidth_limiter.acquire(chunk_size);
+        const auto sent = send(socket, reinterpret_cast<const char*>(data), static_cast<int>(chunk_size), 0);
         if (sent <= 0) {
             return false;
         }
@@ -1118,8 +1288,9 @@ std::string mime_type(const fs::path& path) {
 
 class RateLimiter {
 public:
-    // Small rolling budgets are enough here because the service only exposes a
-    // handful of GET endpoints and should degrade predictably under abuse.
+    // Repair passes can legitimately request hundreds of small packages in a
+    // burst, so keep this as abuse protection rather than a normal-client
+    // throttle.
     bool allow(const std::string& ip, RouteKind route_kind) {
         const auto now = std::chrono::steady_clock::now();
         std::scoped_lock lock(mutex_);
@@ -1268,8 +1439,26 @@ private:
                 continue;
             }
             set_socket_timeouts(client);
+
+            if (active_clients_.fetch_add(1) >= max_active_clients) {
+                --active_clients_;
+                send_response(client, make_text_response(503, "Service Unavailable", "Server is busy.\n"));
+                close_socket(client);
+                continue;
+            }
+
             std::thread([this, client, peer] {
-                handle_client(client, peer);
+                struct ClientGuard {
+                    std::atomic<int>& value;
+                    ~ClientGuard() { --value; }
+                } guard{active_clients_};
+                try {
+                    handle_client(client, peer);
+                } catch (const std::exception& error) {
+                    std::cerr << "client handler failed: " << error.what() << '\n';
+                } catch (...) {
+                    std::cerr << "client handler failed with unknown error\n";
+                }
                 close_socket(client);
             }).detach();
         }
@@ -1409,9 +1598,9 @@ private:
             return;
         }
 
-        const auto path = index_.package_path(sha);
+        const auto path = index_.package_path_for_entry(*entry);
         const auto size = fs::file_size(path);
-        if (size <= max_memory_package_size) {
+        if (size <= max_cached_package_size) {
             auto bytes = read_file_bytes(path);
             package_cache_.put(sha, bytes);
             package_cache_.record_miss();
@@ -1445,15 +1634,18 @@ private:
             ~SendGuard() { --value; }
         } guard{active_sends_};
 
-        if (bundle->package_size <= max_memory_package_size) {
-            if (const auto cached = package_cache_.get(bundle->package_sha256)) {
+        const std::string cache_key = bundle->package_xxh3_64.empty()
+            ? bundle->archive_name
+            : bundle->package_xxh3_64;
+        if (bundle->package_size <= max_cached_package_size) {
+            if (const auto cached = package_cache_.get(cache_key)) {
                 std::cout << ip << " sending mark " << bundle->relative_path << " from RAM\n";
                 send_response(client, make_binary_response("application/x-7z-compressed", *cached, "public, max-age=300, immutable"));
                 return;
             }
 
             auto bytes = read_file_bytes(bundle->archive_path);
-            package_cache_.put(bundle->package_sha256, bytes);
+            package_cache_.put(cache_key, bytes);
             package_cache_.record_miss();
             std::cout << ip << " sending mark " << bundle->relative_path << " from disk into RAM cache\n";
             send_response(client, make_binary_response("application/x-7z-compressed", std::move(bytes), "public, max-age=300, immutable"));
@@ -1554,6 +1746,7 @@ private:
     PackageCache& package_cache_;
     RateLimiter rate_limiter_;
     std::atomic<bool> running_ = false;
+    std::atomic<int> active_clients_ = 0;
     std::atomic<int> active_sends_ = 0;
     socket_handle listen_socket_ = invalid_socket_handle;
     std::thread worker_;
@@ -1686,6 +1879,7 @@ void print_help() {
         << "                           Mark a subtree for whole-archive replacement\n"
         << "  mark /bin/ -version \"v1.1.6\" --force-delete-excess\n"
         << "                           Mark a subtree, store a label, and regenerate\n"
+        << "  warm                      Build missing package archives now\n"
         << "  cache                     Show RAM package cache stats\n"
         << "  cache clear               Empty the RAM package cache\n"
         << "  help                      Show this help\n"
@@ -1703,13 +1897,19 @@ void console_loop(ContentIndex& index, PackageCache& cache, HttpServer& server, 
             } else if (line == "regen" || line.starts_with("regen ")) {
                 const auto version = parse_regen_version(line);
                 index.regenerate(version);
-                std::cout << "Regenerated manifests and packages.\n";
+                std::cout << "Regenerated manifests.\n";
             } else if (line.starts_with("mark ")) {
                 const ParsedMarkCommand mark = parse_mark_command(line);
                 index.add_mark(mark.relative_path, mark.version, mark.force_delete_excess);
                 index.regenerate(mark.version);
                 std::cout << "Marked " << normalize_mark_path(mark.relative_path)
                           << " for subtree replacement and regenerated manifests.\n";
+            } else if (line == "warm") {
+                const std::size_t warmed = index.warm_packages();
+                index.regenerate();
+                std::cout << "Built " << warmed << " missing package archive"
+                          << (warmed == 1 ? "" : "s")
+                          << " and refreshed manifests.\n";
             } else if (line == "cache") {
                 std::cout << cache.status() << '\n';
             } else if (line == "cache clear") {
