@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -442,6 +443,17 @@ std::vector<std::uint8_t> read_file_bytes(const fs::path& path) {
     return bytes;
 }
 
+std::string read_text_file_if_exists(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return {};
+    }
+
+    std::ostringstream out;
+    out << input.rdbuf();
+    return out.str();
+}
+
 void write_text_file(const fs::path& path, std::string_view text) {
     fs::create_directories(path.parent_path());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -522,6 +534,7 @@ class ContentIndex {
 public:
     explicit ContentIndex(Config config) : config_(std::move(config)) {
         load_marks();
+        load_existing_manifests();
     }
 
     const Config& config() const {
@@ -604,6 +617,15 @@ public:
     std::string checksum_toon() const {
         std::scoped_lock lock(mutex_);
         return checksum_toon_;
+    }
+
+    bool checksum_ready() const {
+        std::scoped_lock lock(mutex_);
+        return !checksum_toon_.empty();
+    }
+
+    bool regenerating() const {
+        return regenerating_.load();
     }
 
     std::string version_value() const {
@@ -888,7 +910,7 @@ private:
         out << "schema: 1\n";
         out << "version: " << version << '\n';
         out << "generated_at: " << timestamp_utc() << '\n';
-        out << "root: csgo\n\n";
+        out << "root: .\n\n";
         out << "files:\n";
         for (const auto& entry : entries) {
             out << "  - path: " << entry.relative_path << '\n'
@@ -983,6 +1005,26 @@ private:
                 << "    force_delete_excess: " << (mark.force_delete_excess ? "true" : "false") << '\n';
         }
         write_text_file(marks_config_path(), out.str());
+    }
+
+    void load_existing_manifests() {
+        std::string version_text = read_text_file_if_exists(config_.root / "version.toon");
+        std::string checksum_text = read_text_file_if_exists(config_.root / "checksum.toon");
+
+        if (version_text.empty()) {
+            version_text = read_text_file_if_exists(config_.cache / "version.toon");
+        }
+        if (checksum_text.empty()) {
+            checksum_text = read_text_file_if_exists(config_.cache / "checksum.toon");
+        }
+
+        if (version_text.empty() && checksum_text.empty()) {
+            return;
+        }
+
+        std::scoped_lock lock(mutex_);
+        version_toon_ = std::move(version_text);
+        checksum_toon_ = std::move(checksum_text);
     }
 
     mutable std::mutex mutex_;
@@ -1163,6 +1205,7 @@ public:
     void stop() {
         running_ = false;
         if (listen_socket_ != invalid_socket_handle) {
+            shutdown(listen_socket_, SHUT_RDWR);
             close_socket(listen_socket_);
             listen_socket_ = invalid_socket_handle;
         }
@@ -1212,7 +1255,6 @@ private:
 
         int reuse = 1;
         setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
-        set_socket_timeouts(listen_socket_);
 
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -1232,8 +1274,8 @@ private:
             socklen_t peer_size = sizeof(peer);
             const auto client = accept(listen_socket_, reinterpret_cast<sockaddr*>(&peer), &peer_size);
             if (client == invalid_socket_handle) {
-                if (running_) {
-                    std::cerr << "accept failed\n";
+                if (running_ && errno != EINTR) {
+                    std::cerr << "accept failed: " << std::strerror(errno) << '\n';
                 }
                 continue;
             }
@@ -1307,7 +1349,10 @@ private:
             const auto entries = index_.entries();
             std::ostringstream body;
             body << "{\"ok\":true,\"files\":" << entries.size()
-                 << ",\"version\":\"" << json_escape(index_.version_value()) << "\"}\n";
+                 << ",\"version\":\"" << json_escape(index_.version_value()) << "\""
+                 << ",\"checksum_ready\":" << (index_.checksum_ready() ? "true" : "false")
+                 << ",\"regenerating\":" << (index_.regenerating() ? "true" : "false")
+                 << "}\n";
             ResponseSpec response;
             response.content_type = "application/json";
             response.body_text = body.str();
@@ -1315,12 +1360,20 @@ private:
             return;
         }
         if (target.kind == RouteKind::version_toon) {
+            if (!index_.checksum_ready()) {
+                send_response(client, make_text_response(503, "Service Unavailable", "Checksum is still generating.\n"));
+                return;
+            }
             ResponseSpec response;
             response.body_text = index_.version_toon();
             send_response(client, response);
             return;
         }
         if (target.kind == RouteKind::checksum_toon) {
+            if (!index_.checksum_ready()) {
+                send_response(client, make_text_response(503, "Service Unavailable", "Checksum is still generating.\n"));
+                return;
+            }
             ResponseSpec response;
             response.body_text = index_.checksum_toon();
             send_response(client, response);
@@ -1639,8 +1692,8 @@ void print_help() {
     std::cout
         << "Commands:\n"
         << "  status                    Show root, cache, version, and file counts\n"
-        << "  regen                     Rebuild manifests and missing packages\n"
-        << "  regen -version \"v1.1.6\"   Set version and rebuild\n"
+        << "  regen                     Rebuild version.toon and checksum.toon\n"
+        << "  regen -version \"v1.1.6\"   Set version and rebuild .toon files\n"
         << "  mark /bin/ --force-delete-excess\n"
         << "                           Mark a subtree for whole-archive replacement\n"
         << "  mark /bin/ -version \"v1.1.6\" --force-delete-excess\n"
