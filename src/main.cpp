@@ -587,6 +587,8 @@ public:
             entry.size = item.file_size();
             entry.xxh3_64 = xxh3_file(absolute);
             load_package_metadata_if_present(entry);
+            entry.package_size = entry.size;
+            entry.package_xxh3_64 = entry.xxh3_64;
             next_entries.push_back(std::move(entry));
         }
 
@@ -653,7 +655,8 @@ public:
             return std::nullopt;
         }
 
-        ensure_package(*entry);
+        entry->package_size = entry->size;
+        entry->package_xxh3_64 = entry->xxh3_64;
 
         std::string version_text;
         std::string checksum_text;
@@ -777,14 +780,13 @@ public:
             << "marked bundles: " << marked_bundles_.size() << '\n'
             << "built marked bundles: " << built_marked_bundles << '/' << marked_bundles_.size() << '\n'
             << "files: " << entries_.size() << '\n'
-            << "built file packages: " << built_packages << '/' << entries_.size() << '\n'
+            << "raw file sends: " << entries_.size() << '\n'
             << "source bytes: " << source_bytes << '\n'
             << "package bytes: " << package_bytes;
         return out.str();
     }
 
     std::size_t warm_packages() {
-        const auto file_entries = entries();
         std::vector<MarkedTreeBundle> mark_entries;
         {
             std::scoped_lock lock(mutex_);
@@ -792,15 +794,6 @@ public:
         }
 
         std::size_t warmed = 0;
-        for (FileEntry entry : file_entries) {
-            const auto path = package_path_for_entry(entry);
-            if (fs::exists(path)) {
-                continue;
-            }
-            ensure_package(entry);
-            ++warmed;
-        }
-
         for (MarkedTreeBundle bundle : mark_entries) {
             if (fs::exists(bundle.archive_path)) {
                 continue;
@@ -1071,9 +1064,9 @@ private:
             out << "  - path: " << entry.relative_path << '\n'
                 << "    size: " << entry.size << '\n'
                 << "    xxh3_64: " << entry.xxh3_64 << '\n'
-                << "    package: files/" << entry.xxh3_64 << ".7z\n"
-                << "    package_size: " << entry.package_size << '\n'
-                << "    package_xxh3_64: " << entry.package_xxh3_64 << '\n';
+                << "    package: files/" << entry.xxh3_64 << '\n'
+                << "    package_size: " << entry.size << '\n'
+                << "    package_xxh3_64: " << entry.xxh3_64 << '\n';
             if (!entry.sha256.empty()) {
                 out << "    sha256: " << entry.sha256 << '\n';
             }
@@ -1634,12 +1627,14 @@ private:
 
     void send_package(socket_handle client, const std::string& target, const std::string& ip) {
         const std::string prefix = "/packages/";
-        const std::string suffix = ".7z";
-        if (!target.ends_with(suffix)) {
+        std::string sha = target.substr(prefix.size());
+        if (sha.ends_with(".7z")) {
+            sha.resize(sha.size() - std::string(".7z").size());
+        }
+        if (sha.empty() || sha.find('/') != std::string::npos || sha.find('\\') != std::string::npos) {
             send_response(client, make_text_response(404, "Not Found", "Package not found.\n"));
             return;
         }
-        const auto sha = target.substr(prefix.size(), target.size() - prefix.size() - suffix.size());
         if (!is_hex_hash(sha)) {
             send_response(client, make_text_response(404, "Not Found", "Package not found.\n"));
             return;
@@ -1658,31 +1653,31 @@ private:
         } guard{active_sends_};
 
         if (const auto cached = package_cache_.get(sha)) {
-            std::cout << ip << " sending " << sha << ".7z from RAM\n";
-            auto response = make_binary_response("application/x-7z-compressed", *cached, "public, max-age=300, immutable");
+            std::cout << ip << " sending raw " << entry->relative_path << " from RAM\n";
+            auto response = make_binary_response(mime_type(entry->absolute_path), *cached, "public, max-age=300, immutable");
             response.headers = package_headers(*entry);
             send_response(client, response);
             return;
         }
 
-        const auto path = index_.package_path_for_entry(*entry);
+        const auto path = entry->absolute_path;
         const auto size = fs::file_size(path);
         if (size <= max_cached_package_size) {
             auto bytes = read_file_bytes(path);
             package_cache_.put(sha, bytes);
             package_cache_.record_miss();
-            std::cout << ip << " sending " << sha << ".7z from disk into RAM cache\n";
-            auto response = make_binary_response("application/x-7z-compressed", std::move(bytes), "public, max-age=300, immutable");
+            std::cout << ip << " sending raw " << entry->relative_path << " from disk into RAM cache\n";
+            auto response = make_binary_response(mime_type(path), std::move(bytes), "public, max-age=300, immutable");
             response.headers = package_headers(*entry);
             send_response(client, response);
             return;
         }
 
         package_cache_.record_miss();
-        std::cout << ip << " streaming " << sha << ".7z from disk\n";
+        std::cout << ip << " streaming raw " << entry->relative_path << " from disk\n";
         send_file_stream(client,
                          path,
-                         "application/x-7z-compressed",
+                         mime_type(path),
                          "public, max-age=300, immutable",
                          package_headers(*entry));
     }
@@ -1771,8 +1766,8 @@ private:
 
     static std::vector<std::pair<std::string, std::string>> package_headers(const FileEntry& entry) {
         return {
-            {"X-LieuMt-Package-Size", std::to_string(entry.package_size)},
-            {"X-LieuMt-Package-XXH3", entry.package_xxh3_64},
+            {"X-LieuMt-Package-Size", std::to_string(entry.size)},
+            {"X-LieuMt-Package-XXH3", entry.xxh3_64},
             {"X-LieuMt-Source-Size", std::to_string(entry.size)},
             {"X-LieuMt-Source-XXH3", entry.xxh3_64}
         };
