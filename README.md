@@ -1,11 +1,10 @@
 # lieuMt
 
-`lieuMt.` is a small C++26 backend for serving a CS:GO client mirror, generating `version.toon` and `checksum.toon`, and publishing cached SHA-addressed `.7z` replacement packages for the `launchMt` updater for the fragMount 2016 CS:GO project.
+`lieuMt.` is a small C++26 backend for serving a CS:GO client mirror, generating `version.toon` and `checksum.toon`, and publishing cached xxHash-addressed `.7z` replacement packages for the `launchMt` updater for the fragMount 2016 CS:GO project.
 
 Target runtime is Debian 12 / Linux. 
 Debian 12 because some silly vPS providers out there still use 12 and I'm soon going to migrate, want to be sure. (Will work fine with 13.)
-Windows support has been removed on purpose.
-Who knows, it might compile but I do not care, nor have I tried.
+Windows support has been removed on purpose and lieuMt. will not compile on Windows.
 
 ## Build
 
@@ -34,7 +33,9 @@ Default flags:
 ## What It Does
 
 - Scans the configured game root and generates `version.toon` and `checksum.toon`
-- Excludes `/cache/` and the generated `.toon` files from the checksum pass
+- Excludes `/cache/`, the generated `.toon` files, and heavy stable trees from the checksum pass
+- Default skipped trees: `/csgo/expressions/`, `/csgo/maps/workshop/`, `/csgo/materials/`, `/csgo/models/`, `/csgo/sounds/`, and `/platform/`
+- Uses `xxh3_64` for game validation instead of SHA256; the launcher still accepts older SHA256 manifests during transition
 - Publishes package paths in `checksum.toon` and creates missing `.7z` archives on first request
 - Caches tracked file packages in `/cache/files/<sha256>.7z`
 - Can mark whole subtrees for authoritative replacement archives under `/cache/marks/`

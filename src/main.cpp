@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <cctype>
 #include <cstdlib>
-#include <cstring>
 #include <cerrno>
 #include <ctime>
 #include <deque>
@@ -36,6 +35,9 @@
 using socket_handle = int;
 static constexpr socket_handle invalid_socket_handle = -1;
 
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -62,7 +64,9 @@ struct FileEntry {
     std::uint64_t size = 0;
     std::uint64_t package_size = 0;
     std::string sha256;
+    std::string xxh3_64;
     std::string package_sha256;
+    std::string package_xxh3_64;
 };
 
 struct MarkRule {
@@ -78,7 +82,9 @@ struct MarkedTreeBundle {
     std::string archive_url;
     fs::path archive_path;
     std::string tree_sha256;
+    std::string tree_xxh3_64;
     std::string package_sha256;
+    std::string package_xxh3_64;
     std::uint64_t package_size = 0;
     std::size_t file_count = 0;
     bool force_delete_excess = true;
@@ -114,6 +120,8 @@ struct RouteTarget {
 };
 
 std::string trim_ascii(std::string value);
+bool path_has_cache_segment(const fs::path& path);
+bool path_is_default_excluded(std::string_view relative_path);
 
 std::string quote(std::string_view value) {
     std::ostringstream out;
@@ -148,17 +156,8 @@ std::string json_escape(std::string_view value) {
     return out.str();
 }
 
-std::string to_hex(const std::vector<std::uint8_t>& bytes) {
-    std::ostringstream out;
-    out << std::hex << std::setfill('0');
-    for (std::uint8_t byte : bytes) {
-        out << std::setw(2) << int(byte);
-    }
-    return out.str();
-}
-
-bool is_hex_sha256(std::string_view value) {
-    if (value.size() != 64) {
+bool is_hex_hash(std::string_view value) {
+    if (value.size() != 16 && value.size() != 64) {
         return false;
     }
     return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
@@ -203,6 +202,12 @@ std::string normalize_mark_path(std::string value) {
     if (!is_safe_relative_path(value)) {
         throw std::runtime_error("mark path must be a safe relative directory");
     }
+    if (path_has_cache_segment(fs::path(value))) {
+        throw std::runtime_error("mark path must not contain cache");
+    }
+    if (path_is_default_excluded(value)) {
+        throw std::runtime_error("mark path is excluded from the fast validation manifest");
+    }
     return value;
 }
 
@@ -241,8 +246,51 @@ bool starts_with_slash(std::string_view value) {
 
 bool path_has_cache_segment(const fs::path& path) {
     for (const auto& part : path) {
-        const auto text = part.generic_string();
-        if (text == "cache") {
+        auto text = part.generic_string();
+        std::ranges::transform(text, text.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (text.find("cache") != std::string::npos || text.ends_with(".tmp")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string normalize_relative_path_text(std::string value) {
+    std::ranges::replace(value, '\\', '/');
+    while (!value.empty() && value.front() == '/') {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && value.back() == '/') {
+        value.pop_back();
+    }
+    std::ranges::transform(value, value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool path_is_under(std::string_view relative_path, std::string_view root) {
+    return relative_path == root
+        || (relative_path.size() > root.size()
+            && relative_path.starts_with(root)
+            && relative_path[root.size()] == '/');
+}
+
+bool path_is_default_excluded(std::string_view relative_path) {
+    static constexpr std::array<std::string_view, 6> excluded_roots = {
+        "csgo/expressions",
+        "csgo/maps/workshop",
+        "csgo/materials",
+        "csgo/models",
+        "csgo/sounds",
+        "platform"
+    };
+
+    const std::string normalized = normalize_relative_path_text(std::string(relative_path));
+    for (std::string_view root : excluded_roots) {
+        if (path_is_under(normalized, root)) {
             return true;
         }
     }
@@ -286,148 +334,41 @@ std::string timestamp_utc() {
     return out.str();
 }
 
-class Sha256 {
-public:
-    void update(const std::uint8_t* data, std::size_t length) {
-        bit_length_ += static_cast<std::uint64_t>(length) * 8ull;
-        while (length > 0) {
-            const std::size_t room = block_.size() - block_used_;
-            const std::size_t take = std::min(room, length);
-            std::memcpy(block_.data() + block_used_, data, take);
-            block_used_ += take;
-            data += take;
-            length -= take;
-            if (block_used_ == block_.size()) {
-                transform(block_.data());
-                block_used_ = 0;
-            }
-        }
-    }
-
-    std::vector<std::uint8_t> finish() {
-        block_[block_used_++] = 0x80;
-        if (block_used_ > 56) {
-            while (block_used_ < 64) {
-                block_[block_used_++] = 0;
-            }
-            transform(block_.data());
-            block_used_ = 0;
-        }
-        while (block_used_ < 56) {
-            block_[block_used_++] = 0;
-        }
-        for (int i = 7; i >= 0; --i) {
-            block_[block_used_++] = static_cast<std::uint8_t>((bit_length_ >> (i * 8)) & 0xff);
-        }
-        transform(block_.data());
-
-        std::vector<std::uint8_t> digest;
-        digest.reserve(32);
-        for (std::uint32_t word : state_) {
-            digest.push_back(static_cast<std::uint8_t>((word >> 24) & 0xff));
-            digest.push_back(static_cast<std::uint8_t>((word >> 16) & 0xff));
-            digest.push_back(static_cast<std::uint8_t>((word >> 8) & 0xff));
-            digest.push_back(static_cast<std::uint8_t>(word & 0xff));
-        }
-        return digest;
-    }
-
-private:
-    static std::uint32_t rotr(std::uint32_t value, std::uint32_t bits) {
-        return (value >> bits) | (value << (32 - bits));
-    }
-
-    void transform(const std::uint8_t* chunk) {
-        static constexpr std::array<std::uint32_t, 64> k = {
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-        };
-
-        std::array<std::uint32_t, 64> words{};
-        for (std::size_t i = 0; i < 16; ++i) {
-            words[i] = (static_cast<std::uint32_t>(chunk[i * 4]) << 24)
-                | (static_cast<std::uint32_t>(chunk[i * 4 + 1]) << 16)
-                | (static_cast<std::uint32_t>(chunk[i * 4 + 2]) << 8)
-                | static_cast<std::uint32_t>(chunk[i * 4 + 3]);
-        }
-        for (std::size_t i = 16; i < 64; ++i) {
-            const auto s0 = rotr(words[i - 15], 7) ^ rotr(words[i - 15], 18) ^ (words[i - 15] >> 3);
-            const auto s1 = rotr(words[i - 2], 17) ^ rotr(words[i - 2], 19) ^ (words[i - 2] >> 10);
-            words[i] = words[i - 16] + s0 + words[i - 7] + s1;
-        }
-
-        auto a = state_[0];
-        auto b = state_[1];
-        auto c = state_[2];
-        auto d = state_[3];
-        auto e = state_[4];
-        auto f = state_[5];
-        auto g = state_[6];
-        auto h = state_[7];
-
-        for (std::size_t i = 0; i < 64; ++i) {
-            const auto s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-            const auto choice = (e & f) ^ ((~e) & g);
-            const auto temp1 = h + s1 + choice + k[i] + words[i];
-            const auto s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-            const auto majority = (a & b) ^ (a & c) ^ (b & c);
-            const auto temp2 = s0 + majority;
-            h = g;
-            g = f;
-            f = e;
-            e = d + temp1;
-            d = c;
-            c = b;
-            b = a;
-            a = temp1 + temp2;
-        }
-
-        state_[0] += a;
-        state_[1] += b;
-        state_[2] += c;
-        state_[3] += d;
-        state_[4] += e;
-        state_[5] += f;
-        state_[6] += g;
-        state_[7] += h;
-    }
-
-    std::array<std::uint32_t, 8> state_ = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-    };
-    std::array<std::uint8_t, 64> block_{};
-    std::size_t block_used_ = 0;
-    std::uint64_t bit_length_ = 0;
-};
-
-std::string sha256_bytes(std::string_view bytes) {
-    Sha256 sha;
-    sha.update(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size());
-    return to_hex(sha.finish());
+std::string xxh3_digest_to_hex(XXH64_hash_t digest) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << digest;
+    return out.str();
 }
 
-std::string sha256_file(const fs::path& path) {
+std::string xxh3_bytes(std::string_view bytes) {
+    return xxh3_digest_to_hex(XXH3_64bits(bytes.data(), bytes.size()));
+}
+
+std::string xxh3_file(const fs::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         throw std::runtime_error("could not open " + path.string());
     }
-    Sha256 sha;
-    std::array<std::uint8_t, 64 * 1024> buffer{};
+
+    XXH3_state_t* state = XXH3_createState();
+    if (state == nullptr) {
+        throw std::runtime_error("could not allocate xxHash state");
+    }
+
+    XXH3_64bits_reset(state);
+    std::array<char, 1024 * 1024> buffer{};
     while (input) {
-        input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const auto read = input.gcount();
-        if (read > 0) {
-            sha.update(buffer.data(), static_cast<std::size_t>(read));
+        if (read > 0 && XXH3_64bits_update(state, buffer.data(), static_cast<std::size_t>(read)) == XXH_ERROR) {
+            XXH3_freeState(state);
+            throw std::runtime_error("xxHash failed for " + path.string());
         }
     }
-    return to_hex(sha.finish());
+
+    const XXH64_hash_t digest = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
+    return xxh3_digest_to_hex(digest);
 }
 
 std::vector<std::uint8_t> read_file_bytes(const fs::path& path) {
@@ -561,12 +502,24 @@ public:
         const std::vector<MarkedTreeBundle> next_marked_bundles = build_marked_bundles(active_version, marks_snapshot);
 
         std::vector<FileEntry> next_entries;
-        for (const auto& item : fs::recursive_directory_iterator(config_.root)) {
+        const fs::path canonical_root = fs::weakly_canonical(config_.root);
+        for (auto iterator = fs::recursive_directory_iterator(config_.root);
+             iterator != fs::recursive_directory_iterator();
+             ++iterator) {
+            const auto& item = *iterator;
+            const auto absolute = fs::weakly_canonical(item.path());
+            const auto relative = fs::relative(absolute, canonical_root);
+            const auto relative_path = path_to_url_path(relative);
+
+            if (item.is_directory()) {
+                if (path_has_cache_segment(relative) || path_is_default_excluded(relative_path)) {
+                    iterator.disable_recursion_pending();
+                }
+                continue;
+            }
             if (!item.is_regular_file()) {
                 continue;
             }
-            const auto absolute = fs::weakly_canonical(item.path());
-            const auto relative = fs::relative(absolute, fs::weakly_canonical(config_.root));
             if (path_has_cache_segment(relative)) {
                 continue;
             }
@@ -574,7 +527,9 @@ public:
             if (name == "version.toon" || name == "checksum.toon") {
                 continue;
             }
-            const auto relative_path = path_to_url_path(relative);
+            if (path_is_default_excluded(relative_path)) {
+                continue;
+            }
             if (is_under_mark(relative_path, marks_snapshot)) {
                 continue;
             }
@@ -583,7 +538,7 @@ public:
             entry.absolute_path = absolute;
             entry.relative_path = relative_path;
             entry.size = item.file_size();
-            entry.sha256 = sha256_file(absolute);
+            entry.xxh3_64 = xxh3_file(absolute);
             load_package_metadata_if_present(entry);
             next_entries.push_back(std::move(entry));
         }
@@ -635,7 +590,10 @@ public:
 
     std::optional<FileEntry> package_entry(const std::string& sha) const {
         std::scoped_lock lock(mutex_);
-        auto found = std::ranges::find(entries_, sha, &FileEntry::sha256);
+        auto found = std::ranges::find(entries_, sha, &FileEntry::xxh3_64);
+        if (found == entries_.end()) {
+            found = std::ranges::find(entries_, sha, &FileEntry::sha256);
+        }
         if (found == entries_.end()) {
             return std::nullopt;
         }
@@ -779,32 +737,49 @@ private:
     std::vector<FileEntry> collect_mark_files(const MarkRule& mark) const {
         std::vector<FileEntry> files;
         const fs::path mark_root = fs::weakly_canonical(config_.root / fs::path(mark.relative_path));
-        for (const auto& item : fs::recursive_directory_iterator(mark_root)) {
+        const fs::path canonical_root = fs::weakly_canonical(config_.root);
+        for (auto iterator = fs::recursive_directory_iterator(mark_root);
+             iterator != fs::recursive_directory_iterator();
+             ++iterator) {
+            const auto& item = *iterator;
+            const auto absolute = fs::weakly_canonical(item.path());
+            const auto relative = path_to_url_path(fs::relative(absolute, canonical_root));
+
+            if (item.is_directory()) {
+                if (path_has_cache_segment(fs::path(relative)) || path_is_default_excluded(relative)) {
+                    iterator.disable_recursion_pending();
+                }
+                continue;
+            }
             if (!item.is_regular_file()) {
                 continue;
             }
-            const auto absolute = fs::weakly_canonical(item.path());
-            const auto relative = path_to_url_path(fs::relative(absolute, fs::weakly_canonical(config_.root)));
             if (!is_safe_relative_path(relative)) {
+                continue;
+            }
+            if (path_has_cache_segment(fs::path(relative))) {
+                continue;
+            }
+            if (path_is_default_excluded(relative)) {
                 continue;
             }
             FileEntry entry;
             entry.absolute_path = absolute;
             entry.relative_path = relative;
             entry.size = item.file_size();
-            entry.sha256 = sha256_file(absolute);
+            entry.xxh3_64 = xxh3_file(absolute);
             files.push_back(std::move(entry));
         }
         std::ranges::sort(files, {}, &FileEntry::relative_path);
         return files;
     }
 
-    std::string compute_tree_sha256(const std::vector<FileEntry>& files) const {
+    std::string compute_tree_xxh3_64(const std::vector<FileEntry>& files) const {
         std::ostringstream payload;
         for (const FileEntry& entry : files) {
-            payload << entry.relative_path << '\t' << entry.size << '\t' << entry.sha256 << '\n';
+            payload << entry.relative_path << '\t' << entry.size << '\t' << entry.xxh3_64 << '\n';
         }
-        return sha256_bytes(payload.str());
+        return xxh3_bytes(payload.str());
     }
 
     fs::path mark_archive_path(std::string_view relative_path, std::string_view tree_sha256) const {
@@ -829,7 +804,7 @@ private:
         }
 
         bundle.package_size = fs::file_size(bundle.archive_path);
-        bundle.package_sha256 = sha256_file(bundle.archive_path);
+        bundle.package_xxh3_64 = xxh3_file(bundle.archive_path);
         bundle.archive_name = bundle.archive_path.filename().string();
         bundle.archive_url = "/marks/" + bundle.archive_name;
     }
@@ -841,7 +816,7 @@ private:
             return;
         }
         bundle.package_size = fs::file_size(bundle.archive_path);
-        bundle.package_sha256 = sha256_file(bundle.archive_path);
+        bundle.package_xxh3_64 = xxh3_file(bundle.archive_path);
     }
 
     std::vector<MarkedTreeBundle> build_marked_bundles(std::string_view version, const std::vector<MarkRule>& marks) {
@@ -857,8 +832,8 @@ private:
             bundle.version = mark.version.empty() ? std::string(version) : mark.version;
             bundle.force_delete_excess = mark.force_delete_excess;
             bundle.file_count = files.size();
-            bundle.tree_sha256 = compute_tree_sha256(files);
-            bundle.archive_path = mark_archive_path(mark.relative_path, bundle.tree_sha256);
+            bundle.tree_xxh3_64 = compute_tree_xxh3_64(files);
+            bundle.archive_path = mark_archive_path(mark.relative_path, bundle.tree_xxh3_64);
             load_mark_bundle_metadata_if_present(bundle);
             bundles.push_back(std::move(bundle));
         }
@@ -870,7 +845,7 @@ private:
         if (!command_exists_7z()) {
             throw std::runtime_error("7z was not found on PATH; install 7-Zip or add 7z to PATH");
         }
-        const auto package = package_path(entry.sha256);
+        const auto package = package_path(entry.xxh3_64.empty() ? entry.sha256 : entry.xxh3_64);
         if (!fs::exists(package)) {
             const auto tmp = package;
             fs::create_directories(tmp.parent_path());
@@ -882,16 +857,16 @@ private:
             }
         }
         entry.package_size = fs::file_size(package);
-        entry.package_sha256 = sha256_file(package);
+        entry.package_xxh3_64 = xxh3_file(package);
     }
 
     void load_package_metadata_if_present(FileEntry& entry) const {
-        const auto package = package_path(entry.sha256);
+        const auto package = package_path(entry.xxh3_64.empty() ? entry.sha256 : entry.xxh3_64);
         if (!fs::exists(package)) {
             return;
         }
         entry.package_size = fs::file_size(package);
-        entry.package_sha256 = sha256_file(package);
+        entry.package_xxh3_64 = xxh3_file(package);
     }
 
     std::string build_version_toon(const std::vector<FileEntry>& entries, std::string_view version) const {
@@ -915,11 +890,17 @@ private:
         for (const auto& entry : entries) {
             out << "  - path: " << entry.relative_path << '\n'
                 << "    size: " << entry.size << '\n'
-                << "    sha256: " << entry.sha256 << '\n'
-                << "    package: files/" << entry.sha256 << ".7z\n"
+                << "    xxh3_64: " << entry.xxh3_64 << '\n'
+                << "    package: files/" << entry.xxh3_64 << ".7z\n"
                 << "    package_size: " << entry.package_size << '\n'
-                << "    package_sha256: " << entry.package_sha256 << '\n'
-                << "    memory_eligible: unknown\n";
+                << "    package_xxh3_64: " << entry.package_xxh3_64 << '\n';
+            if (!entry.sha256.empty()) {
+                out << "    sha256: " << entry.sha256 << '\n';
+            }
+            if (!entry.package_sha256.empty()) {
+                out << "    package_sha256: " << entry.package_sha256 << '\n';
+            }
+            out << "    memory_eligible: unknown\n";
         }
         out << "\nmarks:\n";
         for (const MarkedTreeBundle& bundle : marked_bundles) {
@@ -927,10 +908,16 @@ private:
                 << "    version: " << bundle.version << '\n'
                 << "    package: marks/" << bundle.archive_name << '\n'
                 << "    package_size: " << bundle.package_size << '\n'
-                << "    package_sha256: " << bundle.package_sha256 << '\n'
-                << "    tree_sha256: " << bundle.tree_sha256 << '\n'
+                << "    package_xxh3_64: " << bundle.package_xxh3_64 << '\n'
+                << "    tree_xxh3_64: " << bundle.tree_xxh3_64 << '\n'
                 << "    file_count: " << bundle.file_count << '\n'
                 << "    force_delete_excess: " << (bundle.force_delete_excess ? "true" : "false") << '\n';
+            if (!bundle.package_sha256.empty()) {
+                out << "    package_sha256: " << bundle.package_sha256 << '\n';
+            }
+            if (!bundle.tree_sha256.empty()) {
+                out << "    tree_sha256: " << bundle.tree_sha256 << '\n';
+            }
         }
         return out.str();
     }
@@ -1398,7 +1385,7 @@ private:
             return;
         }
         const auto sha = target.substr(prefix.size(), target.size() - prefix.size() - suffix.size());
-        if (!is_hex_sha256(sha)) {
+        if (!is_hex_hash(sha)) {
             send_response(client, make_text_response(404, "Not Found", "Package not found.\n"));
             return;
         }

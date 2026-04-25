@@ -13,3 +13,8 @@ set_target_properties(lieuMt PROPERTIES
     CXX_EXTENSIONS OFF)
 
 target_compile_options(lieuMt PRIVATE -Wall -Wextra -Wpedantic)
+
+target_include_directories(lieuMt
+    PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/xxhash"
+)
