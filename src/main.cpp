@@ -965,6 +965,7 @@ private:
         const auto build_lock = package_lock_for("file:" + package.filename().string());
         std::scoped_lock package_lock(*build_lock);
 
+        remove_suspicious_package_if_present(entry, package);
         if (!fs::exists(package)) {
             const fs::path tmp = package.string() + ".tmp." + std::to_string(::getpid()) + ".7z";
             fs::create_directories(tmp.parent_path());
@@ -993,8 +994,29 @@ private:
         if (!fs::exists(package)) {
             return;
         }
+        if (package_is_suspicious(entry, package)) {
+            return;
+        }
         entry.package_size = fs::file_size(package);
         entry.package_xxh3_64 = xxh3_file(package);
+    }
+
+    static bool package_is_suspicious(const FileEntry& entry, const fs::path& package) {
+        std::error_code error;
+        const auto archive_size = fs::file_size(package, error);
+        if (error) {
+            return true;
+        }
+        return entry.size > 1024ull * 1024ull && archive_size < 4ull * 1024ull;
+    }
+
+    void remove_suspicious_package_if_present(const FileEntry& entry, const fs::path& package) const {
+        if (!fs::exists(package) || !package_is_suspicious(entry, package)) {
+            return;
+        }
+        std::cerr << "discarding suspicious tiny package " << package.string()
+                  << " for " << entry.relative_path << '\n';
+        fs::remove(package);
     }
 
     std::string build_version_toon(const std::vector<FileEntry>& entries, std::string_view version) const {
