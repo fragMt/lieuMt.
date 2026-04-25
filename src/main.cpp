@@ -36,7 +36,7 @@ using socket_handle = int;
 static constexpr socket_handle invalid_socket_handle = -1;
 
 #define XXH_INLINE_ALL
-#include <xxhash.h>
+#include <xxhash.hpp>
 
 namespace fs = std::filesystem;
 
