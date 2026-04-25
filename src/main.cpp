@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <cerrno>
 #include <ctime>
 #include <deque>
