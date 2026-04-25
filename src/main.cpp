@@ -969,8 +969,10 @@ private:
             const fs::path tmp = package.string() + ".tmp." + std::to_string(::getpid()) + ".7z";
             fs::create_directories(tmp.parent_path());
             fs::remove(tmp);
-            const std::string command = "7z a -t7z -mx=9 -bd -y "
-                + shell_quote(tmp) + " " + shell_quote(entry.absolute_path);
+            const std::string command = "cd " + shell_quote(config_.root)
+                + " && 7z a -t7z -mx=9 -bd -y "
+                + shell_quote(tmp) + " "
+                + shell_quote(entry.relative_path);
             int code = 0;
             {
                 std::scoped_lock compression_lock(compression_mutex_);
